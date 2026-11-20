@@ -196,9 +196,11 @@ bvar_cv <- function(lambda) {
   }
   fc
 }
-set.seed(422)
-fc_bvar_03 <- bvar_cv(0.3)
-saveRDS(fc_bvar_03, "results/fc_bvar_03.rds")
+#set.seed(422)
+#fc_bvar_03 <- bvar_cv(0.3)
+#saveRDS(fc_bvar_03, "results/fc_bvar_03.rds")
+
+fc_bvar_03 <- readRDS("results/fc_bvar_03.rds")
 
 set.seed(422)
 fc_bvar_005 <- bvar_cv(0.05)
@@ -212,8 +214,10 @@ var_results <- tibble(
 )
 
 saveRDS(var_results, "results/var_results.rds")
+fc_bvar_005 <-readRDS("results/var_results.rds")
 
 var_results |> knitr::kable(digits = 3)
+
 #The BVAR(4) model with lambda = 0.3 performs better than the VAR(4), this is 
 #because the BVAR model shrinks the coefficients towards zero which helps clear
 #some of the estimation error that is present in the VAR(4) model. Compared to
@@ -222,23 +226,129 @@ var_results |> knitr::kable(digits = 3)
 
 #When lambda is set at 0.05 the model performs worse, indicating that there is
 #too much shrinkage and the model is not able to capture the dynamics of the 
-#data. QUESTION
+#data. The model with the lowest RSME doesn't translate to how fairly it will
+#forecast out of sample, since the RSME may just be fitting the training sample
+#and including noise or variation that isn't relevant in making future
+#forecasts.
 
+#DM Test GDP
 e_var4_gdp <- actual[, "gdp"] - fc_var4[, 1]
 e_bvar_gdp <- actual[, "gdp"] - fc_bvar_03[, 1]
 
 forecast::dm.test(e_var4_gdp, e_bvar_gdp, h = 1, power = 2)
 
+#DM Test Inflation 
 e_var4_infl <- actual[, "infl"] - fc_var4[, 5]
 e_bvar_infl <- actual[, "infl"] - fc_bvar_03[, 5]
 
 forecast::dm.test(e_var4_infl, e_bvar_infl, h = 1, power = 2)
 
-#QUESTION
+#The DM test for GDP concludes that the two models don't have equal forecast 
+#accuracy, however for inflation the DM test concludes that the two models do 
+#have equal forecast accurary. This suggests that while the BVAR model has a
+#lower RMSE it doesn't necessarily translate to better forecast accuracy for 
+#all variables, or that it is the best model for future forecasts.
+
+
 
 ### Factor Model 
+md_raw <- read_csv("data/fredmd_2026-09.csv", show_col_types = FALSE)
+tcode <- unlist(md_raw[1, -1])
+md <- md_raw[-1, ] |> mutate(date = as.Date(sasdate, "%m/%d/%Y"))
 
+transform_series <- function(x, code) {
+  d <- function(v) c(NA, diff(v))
+  switch(as.character(code),
+         "1" = x,                      # level
+         "2" = d(x),                   # first difference
+         "3" = d(d(x)),                # second difference
+         "4" = log(x),                 # log
+         "5" = 100 * d(log(x)),        # growth rate
+         "6" = 100 * d(d(log(x))),     # change in the growth rate
+         "7" = d(x / dplyr::lag(x) - 1))
+}
 
+fm <- map2_dfc(md[names(tcode)], tcode, transform_series) |>
+  mutate(date = md$date, .before = 1) |>
+  filter(date >= as.Date("1960-03-01"), date <= as.Date("2019-12-01"))
+
+fm <- fm[, colSums(is.na(fm)) == 0]
+dim(fm)
+
+tcode[c("INDPRO", "PAYEMS", "CPIAUCSL", "FEDFUNDS")]
+#INDPRO and PAYEMS are transformed into growth rates, CPIAUCSL is transformed 
+#into the change in the growth rate, and FEDFUNDS is transformed into its
+#first difference. The federal funds rate is already a rate so it doesn't need 
+#to be logged, whilst INDPRO is in levels so it is logged and differenced to get
+#the growth rate.
+
+Z <- fm |> select(-date) |> as.matrix()
+pc <- prcomp(scale(Z))
+ 
+summary(pc)$importance[, 1:5]
+#The first three factors capture around 30% of the variation in the data 
+
+F1 <- pc$x[, 1] * sign(cor(pc$x[, 1], fm$INDPRO))
+tibble(date = fm$date, F1 = F1) |>
+  ggplot(aes(date, F1)) +
+  geom_line() +
+  labs(title = "First Factor from FRED-MD", x = NULL, y = NULL) +
+  theme_minimal()
+
+sort(abs(cor(pc$x[, 1], Z))[1, ], decreasing = TRUE)[1:8]
+sort(abs(cor(pc$x[, 2], Z))[1, ], decreasing = TRUE)[1:8]
+#The first factor is most correlated with production and employment, the graph
+#fluctuates with the business cycle. The second factor is most correlated with
+#various inflation measures, thus it captures the inflation trends. 
+
+ip <- fm$INDPRO
+n <- nrow(Z)
+init <- which(fm$date == as.Date("1989-12-01"))
+
+e_ar <- NULL
+e_fa <- NULL
+for (T in init:(n - 1)) {
+  F_T <- prcomp(scale(Z[1:T, ]))$x[, 1:3]         # factors using data through T
+  d <- data.frame(y_next = ip[2:T], y = ip[1:(T - 1)], F_T[1:(T - 1), ])
+  new <- data.frame(y = ip[T], t(F_T[T, ]))
+  e_ar <- c(e_ar, ip[T + 1] - predict(lm(y_next ~ y, d), new))
+  e_fa <- c(e_fa, ip[T + 1] - predict(lm(y_next ~ ., d), new))
+}
+
+c(RMSE_AR = sqrt(mean(e_ar^2)), RMSE_FA = sqrt(mean(e_fa^2)))
+#Estimating the factors once introduce information leakage in the TS-CV causing
+#the factor model to lose forecast accuracy. 
+
+direct_race <- function(series, h = 12, r = 3) {
+  lv <- md |>
+    mutate(log_x = log(.data[[series]]),
+           g = 100 * (log_x - lag(log_x))) |>
+    filter(date >= as.Date("1960-03-01"), date <= as.Date("2019-12-01"))
+  yh <- 100 * (lead(lv$log_x, h) - lv$log_x)      # growth over the next h months
+  g  <- lv$g                                      # growth over the latest month
+  
+  e_ar <- NULL
+  e_fa <- NULL
+  for (T in init:(n - h)) {
+    F_T <- prcomp(scale(Z[1:T, ]))$x[, 1:r, drop = FALSE]
+    i <- 1:(T - h)
+    d <- data.frame(yh = yh[i], g = g[i], F_T[i, , drop = FALSE])
+    new <- data.frame(g = g[T], F_T[T, , drop = FALSE])
+    e_ar <- c(e_ar, yh[T] - predict(lm(yh ~ g, d), new))
+    e_fa <- c(e_fa, yh[T] - predict(lm(yh ~ ., d), new))
+  }
+  tibble(series, forecasts = length(e_ar),
+         RMSE_AR = sqrt(mean(e_ar^2)), RMSE_FA = sqrt(mean(e_fa^2)),
+         MAE_AR = mean(abs(e_ar)), MAE_FA = mean(abs(e_fa)),
+         DM_pvalue = forecast::dm.test(e_ar, e_fa, h = h, power = 2,
+                                       varestimator = "bartlett")$p.value)
+}
+
+direct_race("CPIAUCSL")
+#The factors do improve the forecast accuracy of the CPIAUCSL series, with a 
+#lower RMSE and MAE. The RSME is reduced by around 10%, the difference in the 
+#models is statistically significant since the p-value from a DM test is less
+#than 0.05.
 
 
 
